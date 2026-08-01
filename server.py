@@ -250,6 +250,14 @@ class TeamStatusIn(BaseModel):
 
 
 # ---- Auth Routes ----
+app.include_router(api)
+@app.get("/")
+async def root():
+    return {
+        "status": "ok",
+        "message": "Student Event Evaluation Management System API is running"
+    }
+
 @api.post("/auth/login")
 async def login(body: LoginIn, response: Response):
     email = body.email.lower().strip()
@@ -2052,6 +2060,7 @@ app.include_router(api)
 
 _cors_env = os.environ.get("CORS_ORIGINS", "http://localhost:3000")
 _origins = [o.strip() for o in _cors_env.split(",") if o.strip()]
+logger.info(f"CORS Origins: {_origins}")
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
