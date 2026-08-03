@@ -1,11 +1,9 @@
+import requests
 from dotenv import load_dotenv
 from pathlib import Path
-from fastapi_mail import MessageSchema, FastMail, ConnectionConfig
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 from openpyxl import load_workbook, Workbook
-from openpyxl.styles import Font
-from fastapi.responses import StreamingResponse
 from io import BytesIO
 import os
 import io
@@ -27,16 +25,6 @@ from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-conf = ConnectionConfig(
-    MAIL_USERNAME=os.getenv("EMAIL"),
-    MAIL_PASSWORD=os.getenv("PASSWORD"),
-    MAIL_FROM=os.getenv("EMAIL"),
-    MAIL_PORT=465,
-    MAIL_SERVER="smtp.gmail.com",
-    MAIL_SSL_TLS=True,
-    MAIL_STARTTLS=False,
-    USE_CREDENTIALS=True,
-)
 
 # ---- DB ----
 mongo_url = os.environ['MONGO_URL']
@@ -247,6 +235,16 @@ class TeamIn(BaseModel):
 
 class TeamStatusIn(BaseModel):
     status: Literal["active", "inactive"]
+
+class BulkStudentStatusIn(BaseModel):
+    student_ids: List[str]
+    status: Literal["active", "inactive"]
+    event_id: Optional[str] = None
+
+
+class BulkStudentDeleteIn(BaseModel):
+    student_ids: List[str]
+    event_id: str
 
 
 # ---- Auth Routes ----
@@ -469,6 +467,73 @@ async def update_student(sid: str, body: StudentIn, user: dict = Depends(require
         raise HTTPException(404, "Not found")
     return await db.students.find_one({"id": sid}, {"_id": 0})
 
+@api.delete("/students/bulk")
+async def bulk_delete_students(
+    body: BulkStudentDeleteIn,
+    user: dict = Depends(require_role("super_admin"))
+):
+    deleted = 0
+
+    for sid in body.student_ids:
+
+        student = await db.students.find_one({"id": sid})
+
+        if not student:
+            continue
+
+        evaluations = await db.evaluations.find(
+            {
+                "student_id": sid,
+                "event_id": body.event_id
+            },
+            {"id": 1}
+        ).to_list(None)
+
+        evaluation_ids = [e["id"] for e in evaluations]
+
+        if evaluation_ids:
+            await db.evaluation_marks.delete_many(
+                {
+                    "evaluation_id": {
+                        "$in": evaluation_ids
+                    }
+                }
+            )
+
+        await db.evaluations.delete_many(
+            {
+                "student_id": sid,
+                "event_id": body.event_id
+            }
+        )
+
+        await db.assignments.delete_many(
+            {
+                "student_id": sid,
+                "event_id": body.event_id
+            }
+        )
+
+        await db.students.update_one(
+            {"id": sid},
+            {
+                "$pull": {
+                    "event_ids": body.event_id
+                }
+            }
+        )
+
+        student = await db.students.find_one({"id": sid})
+
+        if student and not student.get("event_ids"):
+            await db.students.delete_one({"id": sid})
+
+        deleted += 1
+
+    return {
+        "deleted": deleted
+    }
+
 @api.delete("/students/{sid}")
 async def delete_student(
     sid: str,
@@ -651,6 +716,29 @@ async def upload_students(file: UploadFile = File(...),event_id: str = Form(...)
         await db.students.insert_one(d)
         created += 1
     return {"created": created, "skipped": skipped}
+
+@api.patch("/students/bulk-status")
+async def bulk_student_status(
+    body: BulkStudentStatusIn,
+    user: dict = Depends(require_role("super_admin"))
+):
+    result = await db.students.update_many(
+        {
+            "id": {
+                "$in": body.student_ids
+            }
+        },
+        {
+            "$set": {
+                "status": body.status
+            }
+        }
+    )
+
+    return {
+        "updated": result.modified_count
+    }
+
 
 
 # ---- Teams ----
@@ -1036,14 +1124,179 @@ async def set_team_status(
         {"id": team_id},
         {"_id": 0}
     )
+# ----------------------------------------------------------
+# TEAM UPLOAD HELPERS
+# ----------------------------------------------------------
 
+TEAM_LEADER_PREFIX = "Team Leader"
+TEAM_MEMBER_PREFIX = "Team Member"
+
+
+def normalize_header(header):
+    if header is None:
+        return ""
+    return " ".join(str(header).strip().split())
+
+
+def build_header_map(headers):
+    """
+    Stores every occurrence of a header.
+
+    Example:
+
+    Team Member Enrollment -> [9,16]
+    """
+
+    mapping = {}
+
+    for idx, h in enumerate(headers):
+
+        h = normalize_header(h)
+
+        mapping.setdefault(h, []).append(idx)
+
+    return mapping
+
+
+def get_cell(row, header_map, column, occurrence=0):
+
+    indexes = header_map.get(column)
+
+    if not indexes:
+        return ""
+
+    if occurrence >= len(indexes):
+        return ""
+
+    value = row[indexes[occurrence]]
+
+    if value is None:
+        return ""
+
+    return str(value).strip()
+
+
+async def get_or_create_student(
+    enrollment_no,
+    student_name,
+    email,
+    phone_no,
+    semester,
+    department,
+    institute,
+    event_id
+):
+    """
+    Creates a student if not present.
+    If already present, only updates event_ids.
+    Returns student id.
+    """
+
+    existing = await db.students.find_one(
+        {
+            "enrollment_no": enrollment_no
+        }
+    )
+
+    if existing:
+        await db.students.update_one(
+            {"id": existing["id"]},
+            {
+                "$set": {
+                    "student_name": student_name,
+                    "email": email,
+                    "phone_no": phone_no,
+                    "whatsapp_no": phone_no,
+                    "semester": semester,
+                    "department": department,
+                    "institute": institute,
+                },
+                "$addToSet": {
+                    "event_ids": event_id
+                }
+            }
+        )
+
+        return existing["id"]
+
+    student = {
+        "id": str(uuid.uuid4()),
+        "enrollment_no": enrollment_no,
+        "student_name": student_name,
+        "email": email,
+        "phone_no": phone_no,
+        "whatsapp_no": phone_no,
+        "semester": semester,
+        "department": department,
+        "institute": institute,
+        "status": "active",
+        "event_ids": [event_id],
+        "created_at": now_iso()
+    }
+
+    await db.students.insert_one(student)
+
+    return student["id"]
+
+def detect_member_groups(headers):
+    """
+    Detect repeated Team Member blocks automatically.
+
+    Returns:
+
+    [
+        {
+            "enrollment": 9,
+            "name": 10,
+            "email": 11,
+            "contact": 12,
+            "semester": 13,
+            "department": 14,
+            "institute": 15
+        },
+        ...
+    ]
+    """
+
+    groups = []
+
+    i = 0
+
+    while i < len(headers):
+
+        h = normalize_header(headers[i])
+
+        if h == "Team Member Enrollment":
+
+            if i + 6 >= len(headers):
+                break
+
+            groups.append({
+                "enrollment": i,
+                "name": i + 1,
+                "email": i + 2,
+                "contact": i + 3,
+                "semester": i + 4,
+                "department": i + 5,
+                "institute": i + 6
+            })
+
+            i += 7
+
+        else:
+            i += 1
+
+    return groups
+
+# ----------------------------------------------------------
+# TEAM UPLOAD
+# ----------------------------------------------------------
 @api.post("/teams/upload")
 async def upload_teams(
     event_id: str,
     file: UploadFile = File(...),
     user: dict = Depends(require_role("super_admin"))
 ):
-
     event = await db.events.find_one({"id": event_id})
 
     if not event:
@@ -1057,141 +1310,236 @@ async def upload_teams(
     if len(rows) < 2:
         raise HTTPException(400, "Excel file is empty")
 
-    headers = [
-        str(h).strip() if h else ""
-        for h in rows[0]
-    ]
+    headers = [normalize_header(h) for h in rows[0]]
+    member_groups = detect_member_groups(headers)
 
-    # Required columns
+    header_map = build_header_map(headers)
+
     required = [
         "Team Name",
-        "Leader Enrollment"
+        "Team Leader Enrollment",
+        "Team Leader Name",
+        "Team Leader Email",
+        "Team Leader Contact Number",
+        "Team Leader Semester",
+        "Team Leader Department",
+        "Team Leader Institute",
+        "Team Size (Including Team Leader)"
     ]
 
     for col in required:
-        if col not in headers:
+        if col not in header_map:
             raise HTTPException(
                 400,
                 f"Missing column: {col}"
             )
 
-    idx_team = headers.index("Team Name")
-    idx_leader = headers.index("Leader Enrollment")
 
-    # Find all member enrollment columns
-    member_columns = []
+    teams_created = 0
+    students_created = 0
+    students_updated = 0
 
-    for i, h in enumerate(headers):
-
-        if "Member" in h and "Enrollment" in h:
-            member_columns.append(i)
-
-    inserted = 0
+    # ------------------------------------------------------
+    # Process every row
+    # ------------------------------------------------------
 
     for row in rows[1:]:
 
         if all(v is None for v in row):
             continue
 
-        team_name = str(row[idx_team]).strip()
+        team_name = get_cell(
+            row,
+            header_map,
+            "Team Name"
+        )
 
-        leader_enrollment = str(
-            row[idx_leader]
-        ).strip()
+        if not team_name:
+            continue
 
-        leader = await db.students.find_one({
-            "enrollment_no": leader_enrollment
+        # ------------------------------------------
+        # Leader
+        # ------------------------------------------
+
+        leader_existing = await db.students.find_one({
+            "enrollment_no":
+            get_cell(
+                row,
+                header_map,
+                "Team Leader Enrollment"
+            )
         })
 
-        if not leader:
-            raise HTTPException(
-                400,
-                f"Leader {leader_enrollment} not found."
-            )
+        leader_id = await get_or_create_student(
+            enrollment_no=get_cell(
+                row,
+                header_map,
+                "Team Leader Enrollment"
+            ),
+            student_name=get_cell(
+                row,
+                header_map,
+                "Team Leader Name"
+            ),
+            email=get_cell(
+                row,
+                header_map,
+                "Team Leader Email"
+            ),
+            phone_no=get_cell(
+                row,
+                header_map,
+                "Team Leader Contact Number"
+            ),
+            semester=get_cell(
+                row,
+                header_map,
+                "Team Leader Semester"
+            ),
+            department=get_cell(
+                row,
+                header_map,
+                "Team Leader Department"
+            ),
+            institute=get_cell(
+                row,
+                header_map,
+                "Team Leader Institute"
+            ),
+            event_id=event_id
+        )
 
-        # Duplicate Team
-        duplicate = await db.teams.find_one({
+        if leader_existing:
+            students_updated += 1
+        else:
+            students_created += 1
 
-            "team_name": team_name,
+        member_ids = [leader_id]
 
-            "event_id": event_id
+        # ------------------------------------------
+        # Members
+        # ------------------------------------------
 
-        })
+        for group in member_groups:
 
-        if duplicate:
-            raise HTTPException(
-                400,
-                f"Team '{team_name}' already exists."
-            )
+            enrollment = row[group["enrollment"]]
 
-        member_ids = [leader["id"]]
-
-        for col in member_columns:
-
-            if col >= len(row):
+            if enrollment is None:
                 continue
 
-            value = row[col]
+            enrollment = str(enrollment).strip()
 
-            if value is None:
+            if not enrollment:
                 continue
 
-            enrollment = str(value).strip()
-
-            student = await db.students.find_one({
+            existing = await db.students.find_one({
                 "enrollment_no": enrollment
             })
 
-            if not student:
-                raise HTTPException(
-                    400,
-                    f"Student {enrollment} not found."
-                )
+            sid = await get_or_create_student(
 
-            # Already in another team
-            existing = await db.teams.find_one({
-                "event_id": event_id,
-                "member_ids": student["id"]
-            })
+                enrollment_no=enrollment,
+
+                student_name=str(
+                    row[group["name"]] or ""
+                ).strip(),
+
+                email=str(
+                    row[group["email"]] or ""
+                ).strip(),
+
+                phone_no=str(
+                    row[group["contact"]] or ""
+                ).strip(),
+
+                semester=str(
+                    row[group["semester"]] or ""
+                ).strip(),
+
+                department=str(
+                    row[group["department"]] or ""
+                ).strip(),
+
+                institute=str(
+                    row[group["institute"]] or ""
+                ).strip(),
+
+                event_id=event_id
+            )
 
             if existing:
+                students_updated += 1
+            else:
+                students_created += 1
+
+            member_ids.append(sid)
+
+        # Remove duplicate members while preserving order
+        member_ids = list(dict.fromkeys(member_ids))
+
+        # Validate team size
+        expected_size = get_cell(
+            row,
+            header_map,
+            "Team Size (Including Team Leader)"
+        )
+
+        if expected_size:
+            try:
+                expected_size = int(expected_size)
+            except ValueError:
                 raise HTTPException(
                     400,
-                    f"{student['student_name']} already belongs to another team."
+                    f"Invalid Team Size for team '{team_name}'."
                 )
 
-            member_ids.append(student["id"])
+            if expected_size != len(member_ids):
+                raise HTTPException(
+                    400,
+                    f"Team '{team_name}' expected {expected_size} members but found {len(member_ids)}."
+                )
 
-        member_ids = list(set(member_ids))
-
-        await db.teams.insert_one({
-
-            "id": str(uuid.uuid4()),
-
-            "team_id": await generate_team_id(),
-
-            "team_name": team_name,
-
+        # Check if team already exists
+        existing_team = await db.teams.find_one({
             "event_id": event_id,
-
-            "leader_id": leader["id"],
-
-            "member_ids": member_ids,
-
-            "status": "active",
-
-            "created_at": now_iso()
-
+            "team_name": team_name
         })
 
-        inserted += 1
+        if existing_team:
+
+            await db.teams.update_one(
+                {"id": existing_team["id"]},
+                {
+                    "$set": {
+                        "leader_id": leader_id,
+                        "member_ids": member_ids,
+                        "status": "active"
+                    }
+                }
+            )
+
+        else:
+
+            team_doc = {
+                "id": str(uuid.uuid4()),
+                "team_id": await generate_team_id(),
+                "team_name": team_name,
+                "event_id": event_id,
+                "leader_id": leader_id,
+                "member_ids": member_ids,
+                "status": "active",
+                "created_at": now_iso()
+            }
+            await db.teams.insert_one(team_doc)
+            teams_created += 1
 
     return {
-
         "ok": True,
-
-        "teams_created": inserted
-
+        "message": "Teams uploaded successfully.",
+        "teams_created": teams_created,
+        "students_created": students_created,
+        "students_updated": students_updated,
+        "total_rows": len(rows) - 1
     }
 
 @api.get("/teams/export")
@@ -1199,62 +1547,90 @@ async def export_teams(
     event_id: str,
     user: dict = Depends(get_current_user)
 ):
-
     event = await db.events.find_one({"id": event_id})
 
     if not event:
         raise HTTPException(404, "Event not found")
 
-    teams = await db.teams.find({
-        "event_id": event_id
-    }).to_list(1000)
+    teams = await db.teams.find(
+        {
+            "event_id": event_id
+        },
+        {
+            "_id": 0
+        }
+    ).to_list(5000)
+
+    # --------------------------------------------
+    # Find maximum team size
+    # --------------------------------------------
+
+    max_members = 0
+
+    for team in teams:
+        max_members = max(
+            max_members,
+            len(team.get("member_ids", []))
+        )
+
+    # At least leader + one member columns
+    max_members = max(max_members, 2)
 
     wb = Workbook()
     ws = wb.active
     ws.title = "Teams"
 
     headers = [
-
         "Team Name",
 
-        "Leader Enrollment",
-        "Leader Name",
-        "Leader Email",
-        "Leader Contact",
-        "Leader Semester",
-        "Leader Department",
-        "Leader Institute",
+        "Team Leader Enrollment",
+        "Team Leader Name",
+        "Team Leader Email",
+        "Team Leader Contact Number",
+        "Team Leader Semester",
+        "Team Leader Department",
+        "Team Leader Institute",
 
-        "Team Size",
-
-        "Member1 Enrollment",
-        "Member1 Name",
-
-        "Member2 Enrollment",
-        "Member2 Name",
-
-        "Member3 Enrollment",
-        "Member3 Name",
-
-        "Member4 Enrollment",
-        "Member4 Name",
-
-        "Member5 Enrollment",
-        "Member5 Name"
-
+        "Team Size (Including Team Leader)"
     ]
+
+    # --------------------------------------------
+    # Dynamic Member Columns
+    # --------------------------------------------
+
+    for _ in range(max_members - 1):
+
+        headers.extend([
+            "Team Member Enrollment",
+            "Team Member Name",
+            "Team Member Email",
+            "Team Member Contact Number",
+            "Team Member Semester",
+            "Team Member Department",
+            "Team Member Institute"
+        ])
 
     ws.append(headers)
 
-    for cell in ws[1]:
-        cell.font = Font(bold=True)
+    # --------------------------------------------
+    # Export each team
+    # --------------------------------------------
 
     for team in teams:
 
-        leader = await db.students.find_one({
-            "id": team["leader_id"]
-        })
+        leader = await db.students.find_one(
+            {
+                "id": team["leader_id"]
+            },
+            {
+                "_id": 0
+            }
+        )
 
+        if not leader:
+            continue
+
+        # Preserve order from member_ids
         members = []
 
         for sid in team["member_ids"]:
@@ -1262,9 +1638,14 @@ async def export_teams(
             if sid == team["leader_id"]:
                 continue
 
-            student = await db.students.find_one({
-                "id": sid
-            })
+            student = await db.students.find_one(
+                {
+                    "id": sid
+                },
+                {
+                    "_id": 0
+                }
+            )
 
             if student:
                 members.append(student)
@@ -1282,43 +1663,59 @@ async def export_teams(
             leader.get("institute", ""),
 
             len(team["member_ids"])
-
         ]
 
-        for student in members:
+        # --------------------------------------------
+        # Members
+        # --------------------------------------------
+
+        for member in members:
 
             row.extend([
 
-                student.get("enrollment_no", ""),
-
-                student.get("student_name", "")
+                member.get("enrollment_no", ""),
+                member.get("student_name", ""),
+                member.get("email", ""),
+                member.get("phone_no", ""),
+                member.get("semester", ""),
+                member.get("department", ""),
+                member.get("institute", "")
 
             ])
 
-        while len(row) < len(headers):
-            row.append("")
+        # Fill remaining blank member columns
+
+        remaining = max_members - 1 - len(members)
+
+        for _ in range(remaining):
+
+            row.extend([
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                ""
+            ])
 
         ws.append(row)
 
-    output = BytesIO()
+    stream = BytesIO()
 
-    wb.save(output)
+    wb.save(stream)
 
-    output.seek(0)
+    stream.seek(0)
+
+    filename = f"{event['event_name']}_Teams.xlsx"
 
     return StreamingResponse(
-
-        output,
-
+        stream,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-
         headers={
-
             "Content-Disposition":
-            "attachment; filename=teams.xlsx"
-
+            f'attachment; filename="{filename}"'
         }
-
     )
 
 # ---- Evaluators ----
@@ -1464,18 +1861,35 @@ async def send_email(data: EmailRequest):
     if not event:
         raise HTTPException(404, "Event not found")
 
-    message = MessageSchema(
-        subject=f"Invitation to Serve as an Evaluator for {event['event_name']} | Parul University",
-        recipients=[user["email"]],
-        body=f"""
+    headers = {
+        "accept": "application/json",
+        "api-key": os.getenv("BREVO_API_KEY"),
+        "content-type": "application/json",
+    }
+
+    payload = {
+        "sender": {
+            "name": "Technical Event Cell",
+            "email": os.getenv("MAIL_FROM"),
+        },
+        "to": [
+            {
+                "email": user["email"],
+                "name": user["name"],
+            }
+        ],
+        "subject": f"Invitation to Serve as an Evaluator for {event['event_name']} | Parul University",
+        "textContent": f"""
     Dear {user['name']},
 
     Greetings from the Technical Event Cell, Parul University.
 
-    We are pleased to invite you to serve as an Evaluator for the upcoming technical event organized by the Technical Event Cell, Parul University. Your expertise and experience will be instrumental in ensuring a fair, transparent, and insightful evaluation of the participating teams.
+    We are pleased to invite you to serve as an Evaluator for the upcoming technical event organized by the Technical Event Cell, Parul University.
 
     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                EVENT DETAILS
+
+    EVENT DETAILS
+
     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     Event Name : {event['event_name']}
@@ -1484,44 +1898,46 @@ async def send_email(data: EmailRequest):
     Venue      : {event['venue']}
 
     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            EVALUATOR LOGIN
+
+    EVALUATOR LOGIN
+
     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    User ID  : {user['email']}
+    User ID : {user['email']}
 
     Password : YourFirstName@12345
 
     Example:
-    If your name is "Shri Narendra Damodardas Modi",
-    your password will be:
+    If your name is "Shri Narendra Damodardas Modi"
+
+    Password:
 
     Narendra@12345
 
     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    Please log in to the Evaluation Portal using the above credentials. We recommend signing in at least 10–15 minutes before the event begins to ensure a smooth evaluation process.
+    Please login 10-15 minutes before the event.
 
-    Your contribution will play a vital role in encouraging innovation, creativity, and technical excellence among our students. We sincerely appreciate your valuable time and support and look forward to your participation.
-
-    If you have any questions or require any assistance, please do not hesitate to contact us.
-
-    Thank you for accepting our invitation. We look forward to welcoming you to Parul University.
-
-    Warm Regards,
+    Thank you.
 
     Technical Event Cell
     Parul University
-    Vadodara, Gujarat
-
-    Email   : technicaleventcell@paruluniversity.ac.in
-    Contact : +91-XXXXXXXXXX
+    Vadodara
     """,
-        subtype="plain",
+    }
+
+    response = requests.post(
+        "https://api.brevo.com/v3/smtp/email",
+        headers=headers,
+        json=payload,
     )
 
-    fm = FastMail(conf)
-
-    await fm.send_message(message)
+    if response.status_code not in (200, 201):
+        print(response.text)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Brevo Error: {response.text}"
+        )
 
     return {
         "message": f"Invitation sent successfully to {user['name']}"
